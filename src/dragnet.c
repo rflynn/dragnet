@@ -45,18 +45,6 @@ static int Initialized = 0;
  * 0 means unlimited
  */
 static unsigned long MaxBytesPerSec = 256;
-//static size_t MaxSendBytesPerSec = 50;
-//static size_t MaxRecvBytesPerSec = 50;
-
-/* limit the number of bytes returned by a single call;
- * sometimes applications calling recv(..., N) assume they always receive N bytes,
- * whereas they may receive 1..N
- */
-#if 0
-static ssize_t MinByteCount = 0; // TODO
-static ssize_t MaxByteCount = 0; // TODO
-static int     RandomizeByteCount = 0; // TODO
-#endif
 
 static void do_dragnet_init(void)
 {
@@ -73,7 +61,7 @@ static void do_dragnet_init(void)
  */
 struct ratelim {
     struct timeval sec; /* last second we've seen action */
-    size_t secbytes;    /* how many bytes we've passed through during 'prev' second */
+    size_t secbytes;    /* how many bytes we've passed through during 'sec' second */
     size_t pos;
     size_t len;
     struct ratelim *next;
@@ -81,8 +69,7 @@ struct ratelim {
 } ratelim;
 
 /*
- * remember which fds are socket()s and which aren't;
- * only fuck with socket()s
+ * remember which fds are socket()s and which aren't
  */
 static struct trackedsocket {
     int domain;
@@ -255,7 +242,9 @@ int socket(int domain, int type, int protocol)
     return fd;
 }
 
-// FIXME: need this for O_NONBLOCK
+/*
+ * a lot of wasted space necessary to catch O_NONBLOCK, but var args makes it that way...
+ */
 int fcntl(int fd, int cmd, ... /* arg */ )
 {
 	va_list ap;
@@ -309,7 +298,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 {
     dn_log("    >> intercepted send(%d, %p, %zu, %d)\n%.*s\n",
         sockfd, buf, len, flags, (int)len, (const char*)buf);
-    //return do_write(sockfd, buf, len);
+    /* TODO: return do_write(sockfd, buf, len); */
     return syscall(SYS_sendto, sockfd, buf, len, flags, 0, 0);
 }
 
@@ -403,12 +392,6 @@ static ssize_t do_write(int fd, const void *buf, size_t count)
         {
             /* if local cache is empty, do actual call... */
             wr = syscall(SYS_write, fd, ptr, wr);
-            if (wr >= 0) /* success */
-            {
-                if (wr > 0)
-                {
-                }
-            }
         }
     }
     return wr;
@@ -485,4 +468,3 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
     }
     return p;
 }
-
