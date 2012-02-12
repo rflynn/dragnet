@@ -6,10 +6,10 @@
     $ make
 
 ## Examples
-    # watch google load in slow-mo via wget's blocking sockets
+    # watch google load in slow-mo via wget's recv(..., MSG_PEEK) blocking sockets
     $ LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 2>/dev/null
 
-    # watch google load in slow-mo via curl's non-blocking sockets
+    # watch google load in slow-mo via curl's poll()-driven non-blocking sockets
     $ LD_PRELOAD=./dragnet.so curl http://www.google.com/ -o - 2>/dev/null
 
     # watch dragnet at work
