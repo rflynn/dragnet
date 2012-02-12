@@ -57,7 +57,7 @@ static void do_dragnet_init(void)
 }
 
 /*
- * per-Socket ratelimiting
+ * per-trackedsocket ratelimiting
  */
 struct ratelim {
     struct timeval sec; /* last second we've seen action */
@@ -92,15 +92,17 @@ static void ratelim_init(struct ratelim *r)
 static void ratelim_destroy(struct ratelim **r)
 {
     if (*r)
-    {
-        free(*r);
-        *r = 0;
-    }
+        free(*r), *r = 0;
+}
+
+struct trackedsocket * trackedsocket_byfd(int fd)
+{
+    return Socket + fd;
 }
 
 static void trackedsocket_init(int fd, int domain, int type, int protocol)
 {
-    struct trackedsocket *t = Socket + fd;
+    struct trackedsocket *t = trackedsocket_byfd(fd);
     t->domain = domain;
     t->type = type;
     ratelim_destroy(&t->rd);
@@ -241,7 +243,7 @@ int socket(int domain, int type, int protocol)
  */
 int fcntl(int fd, int cmd, ... /* arg */ )
 {
-	va_list ap;
+    va_list ap;
     va_start(ap, cmd);
     switch (cmd)
     {
@@ -258,7 +260,7 @@ int fcntl(int fd, int cmd, ... /* arg */ )
             dn_log("    >> intercepted fcntl(%d, %d, %ld)\n", fd, cmd, l);
 	        if (cmd == F_SETFL && (l & O_NONBLOCK))
             {
-                struct trackedsocket *t = Socket+fd;
+    		    struct trackedsocket *t = trackedsocket_byfd(fd);
                 t->nonblock = 1;
                 dn_log("      >> fcntl(%d, F_SETFL, &O_NONBLOCK)\n", fd);
             }
@@ -331,7 +333,7 @@ ssize_t read(int fd, void *buf, size_t count)
 static ssize_t do_read(int fd, void *buf, size_t count, int recvflags)
 {
     ssize_t rd;
-    struct trackedsocket *t = Socket+fd;
+    struct trackedsocket *t = trackedsocket_byfd(fd);
     if (!t->domain)
     {
         /* not tracked, pass it through */
@@ -340,29 +342,22 @@ static ssize_t do_read(int fd, void *buf, size_t count, int recvflags)
         unsigned char *ptr;
         /* try local cache first... */
         rd = ratelim_get(t, &t->rd, &ptr, count, recvflags);
-        if (!rd && errno == EAGAIN)
-        {
+        if (!rd && errno == EAGAIN) {
             return -1;
-        } else if (rd > 0)
-        {
+        } else if (rd > 0) {
             memcpy(buf, ptr, rd);
         } else if (!rd) {
             /* if local cache is empty, do the real read()... */
             dn_log("        >> syscall(SYS_READ, %d, %p, %zu)\n", fd, buf, count);
             rd = syscall(SYS_read, fd, buf, count);
-            if (rd < 0)
-            {
+            if (rd < 0) {
                 dn_log("read returned %zd, errno=%d (EAGAIN=%d)\n", rd, errno, EAGAIN);
-            } else if (rd >= 0) /* success */
-            {
-                if (rd > 0)
-                {
-                    /* if data's returned, cache it... */
-                    (void)ratelim_put(&t->rd, buf, rd);
-                    /* and read it out again... */
-                    rd = ratelim_get(t, &t->rd, &ptr, count, recvflags);
-                    memcpy(buf, ptr, rd);
-                }
+            } else if (rd > 0) {
+                /* if data's returned, cache it... */
+                (void)ratelim_put(&t->rd, buf, rd);
+                /* and read it out again... */
+                rd = ratelim_get(t, &t->rd, &ptr, count, recvflags);
+                memcpy(buf, ptr, rd);
             }
         }
     }
@@ -371,7 +366,7 @@ static ssize_t do_read(int fd, void *buf, size_t count, int recvflags)
 
 static ssize_t do_write(int fd, const void *buf, size_t count)
 {
-    struct trackedsocket *t = Socket+fd;
+    struct trackedsocket *t = trackedsocket_byfd(fd);
     ssize_t wr;
     if (!t->domain)
     {
@@ -398,8 +393,9 @@ ssize_t write(int fd, const void *buf, size_t count)
 
 int close(int fd)
 {
+    struct trackedsocket *t = trackedsocket_byfd(fd);
     dn_log("    >> intercepted close(%d)\n", fd);
-    if (Socket[fd].domain)
+    if (t->domain)
     {
         dn_log("        >> it's a socket\n");
         trackedsocket_destroy(fd);
@@ -427,7 +423,7 @@ static int do_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     }
     for (i = 0; i < nfds; i++)
     {
-        struct trackedsocket *t = Socket + fds[i].fd;
+        struct trackedsocket *t = trackedsocket_byfd(fds[i].fd);
         if (t->domain && (fds[i].events & POLLIN))
         {
             unsigned char *ptr;
@@ -453,7 +449,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
     p = do_poll(fds, nfds, timeout);
     if (!p)
     {
-        // if we don't find anything, run actual poll
+        /* if we don't find anything, run actual poll */
         if (timeout >= 1000)
             timeout -= 1000;
         p = syscall(SYS_poll, fds, nfds, timeout);
