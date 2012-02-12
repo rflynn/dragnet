@@ -6,10 +6,13 @@
     $ make
 
 ## Examples
-    # watch google load in slow-mo
+    # watch google load in slow-mo via wget's blocking sockets
     $ LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 2>/dev/null
 
-    # watch how dragnet decides what to do
+    # watch google load in slow-mo via curl's non-blocking sockets
+    $ LD_PRELOAD=./dragnet.so curl http://www.google.com/ -o - 2>/dev/null
+
+    # watch dragnet at work
     $ LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - >/dev/null
 
 ## What?
@@ -27,5 +30,4 @@ http://github.com/rflynn/dragnet
 
 ## Who?
 Ryan Flynn parseerror+dragnet@gmail.com
-
 
