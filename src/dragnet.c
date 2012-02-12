@@ -137,15 +137,11 @@ static ssize_t ratelim_get(struct trackedsocket *t, struct ratelim **rl,
         struct timeval now;
         (void)gettimeofday(&now, 0);
         if (now.tv_sec > r->sec.tv_sec)
-        {
             r->secbytes = 0; /* reset per-second bytecount if we're in a different second */
-        }
         if (!peek)
         {
             if (now.tv_sec > r->sec.tv_sec)
-            {
                 r->sec = now; /* only update latest second if we're not peeking */
-            }
             if (MaxBytesPerSec && r->secbytes == MaxBytesPerSec)
             {
                 if (t->nonblock)
@@ -167,10 +163,8 @@ static ssize_t ratelim_get(struct trackedsocket *t, struct ratelim **rl,
         if (MaxBytesPerSec)
             bytes = MIN(bytes, MaxBytesPerSec - r->secbytes);
         *ptr = r->data + r->pos;
-        if (peek)
+        if (!peek)
         {
-            /* "peek" doesn't remove data from the queue */
-        } else {
             r->secbytes += bytes;
             r->pos += bytes;
             if (r->pos == r->len)
@@ -348,7 +342,6 @@ static ssize_t do_read(int fd, void *buf, size_t count, int recvflags)
         rd = ratelim_get(t, &t->rd, &ptr, count, recvflags);
         if (!rd && errno == EAGAIN)
         {
-            errno = EAGAIN;
             return -1;
         } else if (rd > 0)
         {
