@@ -5,28 +5,44 @@
  * Drag:net -- slow an application's internet connection to a crawl
  * Useful for testing/simulating network connections worse than yours
  *
- * Build: $ make
- * Usage: $ LD_PRELOAD=./dragnet.so curl http://www.google.com/ -o -
+ * Build:
+ *   make
  *
- * TODO: make curl work
- * TODO: detect non-blocking socket option and set EWOULDBLOCK instead of sleep()ing
- * TODO: make options set-able from env?
+ * Usage:
+ *   LD_PRELOAD=./dragnet.so foo
+ *
+ * Examples:
+ *   LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 2>/dev/null # watch google load in slow-mo
+ *   LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 1>/dev/null # watch dragnet's actions
+ *
+ * Status:
+ *  - wget works
+ *  - curl works
+ *
+ * TODO:
+ *  - separate send/recv rate limiting
+ *  - make options set-able from env?
  */
 
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <time.h>
+#include <sys/time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <fcntl.h>
 
 /*
  * Rate Limiting : maximum bytes/sec we'll allow through; the rest is cached for future calls
  * 0 means unlimited
  */
-static size_t MaxBytesPerSec = 1024;
+static size_t MaxBytesPerSec = 256;
+//static size_t MaxSendBytesPerSec = 50;
+//static size_t MaxRecvBytesPerSec = 50;
 
 /* limit the number of bytes returned by a single call;
  * sometimes applications calling recv(..., N) assume they always receive N bytes,
@@ -42,12 +58,12 @@ static int     RandomizeByteCount = 0; // TODO
  * per-Socket ratelimiting
  */
 struct ratelim {
-    time_t sec;        /* last second we've seen action */
-    size_t secbytes;   /* how many bytes we've passed through during 'prev' second */
+    struct timeval sec; /* last second we've seen action */
+    size_t secbytes;    /* how many bytes we've passed through during 'prev' second */
     size_t pos;
     size_t len;
-    unsigned char *data;
     struct ratelim *next;
+    unsigned char data[0];
 } ratelim;
 
 /*
@@ -57,17 +73,18 @@ struct ratelim {
 static struct trackedsocket {
     int domain;
     int type;
+    unsigned nonblock:1;
     struct ratelim *rd;
     struct ratelim *wr;
 } Socket[4096]; /* FIXME: base on getrlimit(RLIMIT_NOFILE) */
 
 static void ratelim_init(struct ratelim *r)
 {
-    r->sec = 0;
+    r->sec.tv_sec = 0;
+    r->sec.tv_usec = 0;
     r->secbytes = 0;
     r->pos = 0;
     r->len = 0;
-    r->data = 0;
     r->next = 0;
 }
 
@@ -75,7 +92,6 @@ static void ratelim_destroy(struct ratelim **r)
 {
     if (*r)
     {
-        free((*r)->data);
         free(*r);
         *r = 0;
     }
@@ -95,46 +111,68 @@ static void trackedsocket_destroy(int fd)
     trackedsocket_init(fd, 0, 0, 0);
 }
 
+static void dn_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    (void) vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
 /*
- * if we have bytes buffered, hand them out based on the configuration
+ * return buffered bytes, if we have any, based on our ratelimiting configuration
  */
-static ssize_t ratelim_get(struct ratelim **rl, unsigned char **ptr, size_t len)
+static ssize_t ratelim_get(struct trackedsocket *t, struct ratelim **rl,
+                           unsigned char **ptr, size_t len, int recvflags)
 {
     struct ratelim *r = *rl;
     ssize_t bytes = 0;
+    dn_log("%s(%p, %p, %zu, %d)...\n", __func__, rl, ptr, len, recvflags);
     if (r && r->len > r->pos)
     {
-        time_t now = time(NULL);
-        if (now > r->sec)
+        struct timeval now;
+        (void)gettimeofday(&now, 0);
+        if (now.tv_sec > r->sec.tv_sec)
             r->sec = now, r->secbytes = 0;
         if (MaxBytesPerSec && r->secbytes == MaxBytesPerSec)
         {
-            /* FIXME: only do this for blocking sockets... */
-            /* TODO: keep track of usec so I can sleep more appropriate fraction... */
-            usleep(1000 * 1000);
-            r->secbytes = 0;
+            if (t->nonblock)
+            {
+                usleep(20000); /* artificially introduce 20msec delay to reduce call count... */
+                errno = EAGAIN;
+                return 0;
+            } else {
+                unsigned long usec = 1000 * 1000 - r->sec.tv_usec;
+                dn_log("      >> sleeping for %lu microseconds on blocking socket...\n", usec);
+                usleep(usec);
+                r->secbytes = 0;
+            }
         }
         /* return as many bytes as limiting allows us, and not more than
          * we have to read, and not more than the space we have to write */
         bytes = MIN(r->len - r->pos, len);
         if (MaxBytesPerSec)
             bytes = MIN(bytes, MaxBytesPerSec - r->secbytes);
-        r->secbytes += bytes;
         *ptr = r->data + r->pos;
-        r->pos += bytes;
-        if (r->pos == r->len)
+        if (recvflags & MSG_PEEK)
         {
-            /* done with this buffer, move to next and nuke old space */
-            *rl = r->next;
-            if (*rl)
-                (*rl)->sec = now;
-            free(r->data);
-            free(r);
+            /* "peek" doesn't remove data from the queue */
+        } else {
+            r->secbytes += bytes;
+            r->pos += bytes;
+            if (r->pos == r->len)
+            {
+                /* done with this buffer, move to next and nuke old space */
+                *rl = r->next;
+                if (*rl)
+                    (*rl)->sec = now;
+                free(r);
+            }
         }
     }
-    printf("%s(...) = %zd {r->pos=%zu r->len=%zu}\n",
+    dn_log("      >> %s(...) = %zd {r->pos=%zu r->len=%zu}\n",
         __func__, bytes, r ? r->pos : 0, r ? r->len : 0);
     return bytes;
 }
@@ -144,20 +182,14 @@ static ssize_t ratelim_get(struct ratelim **rl, unsigned char **ptr, size_t len)
  */
 static size_t ratelim_put(struct ratelim **rl, const unsigned char *buf, size_t len)
 {
-    printf("%s(len=%zu)\n", __func__, len);
+    dn_log("      >> %s(len=%zu)\n", __func__, len);
     if (len)
     {
         /* TODO: instead of realloc, use a linked list of buffers */
-        struct ratelim *last = malloc(sizeof *last);
+        struct ratelim *last = malloc(len + sizeof *last);
         if (last)
         {
             ratelim_init(last);
-            last->data = malloc(len);
-            if (!last->data)
-            {
-                free(last);
-                return 0;
-            }
             if (*rl)
             {
                 (*rl)->next = last;
@@ -172,7 +204,7 @@ static size_t ratelim_put(struct ratelim **rl, const unsigned char *buf, size_t 
 }
 
 static ssize_t do_write(int fd, const void *buf, size_t count);
-static ssize_t do_read (int fd,       void *buf, size_t count);
+static ssize_t do_read (int fd,       void *buf, size_t count, int recvflags);
 
 /*********************** intercepted calls follow *******************/
 
@@ -180,40 +212,71 @@ int socket(int domain, int type, int protocol)
 {
     int fd;
     fd = syscall(SYS_socket, domain, type, protocol);
-    printf("    >> intercepted socket(%d, %d, %d) = %d\n",
+    dn_log("    >> intercepted socket(%d, %d, %d) = %d\n",
         domain, type, protocol, fd);
     if (fd >= 0 && (domain == AF_INET || domain == AF_INET6))
     {
-        printf("        >> tracking socket %d\n", fd);
+        dn_log("        >> tracking socket %d\n", fd);
         trackedsocket_init(fd, domain, type, protocol);
     } else {
-        printf("domain = %d\n", domain);
+        dn_log("domain = %d\n", domain);
     }
     return fd;
 }
 
-#if 0
 // FIXME: need this for O_NONBLOCK
-int fcntl(int fd, int cmd, ... /* arg */ );
+int fcntl(int fd, int cmd, ... /* arg */ )
 {
-    printf("    >> intercepted fcntl(%d, %d, ...)\n", fd, cmd);
-    return syscall(SYS_recvfrom, sockfd, buf, len, flags, 0, 0);
+	va_list ap;
+    va_start(ap, cmd);
+    switch (cmd)
+    {
+    case F_DUPFD:
+    case F_GETFL:
+        /* arg is void */
+        dn_log("    >> intercepted fcntl(%d, %d)\n", fd, cmd);
+        return syscall(SYS_fcntl, fd, cmd);
+    case F_GETFD:
+    case F_SETFL:
+        /* arg is long */
+        {
+            long l = va_arg(ap, long);
+            dn_log("    >> intercepted fcntl(%d, %d, %ld)\n", fd, cmd, l);
+	        if (cmd == F_SETFL && (l & O_NONBLOCK))
+            {
+                struct trackedsocket *t = Socket+fd;
+                t->nonblock = 1;
+                dn_log("      >> fcntl(%d, F_SETFL, &O_NONBLOCK)\n", fd);
+            }
+            return syscall(SYS_fcntl, fd, cmd, l);
+        }
+    default:
+        /* arg is pointer */
+        {
+            void *p = va_arg(ap, void*);
+            dn_log("    >> intercepted fcntl(%d, %d, %p)\n", fd, cmd, p);
+            return syscall(SYS_fcntl, fd, cmd, p);
+        }
+    }
 }
-#endif
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 {
     ssize_t rf;
-    printf("    >> intercepted recv(%d, %p, %zu, %d)\n",
+    dn_log("    >> intercepted recv(%d, %p, %zu, %d(",
         sockfd, buf, len, flags);
-    rf = do_read(sockfd, buf, len);
-    printf("recv()ed %zd bytes: %.*s\n", rf, (int)rf, (const char *)buf);
+    if (flags & MSG_PEEK) dn_log("MSG_PEEK,");
+    if (flags & MSG_DONTWAIT) dn_log("MSG_DONTWAIT,");
+    dn_log(")\n");
+    rf = do_read(sockfd, buf, len, flags);
+    if (rf >= 0 || errno != EAGAIN)
+        dn_log("recv()ed %zd bytes: %.*s\n", rf, rf > 0 ? (int)rf : 0, (const char *)buf);
     return rf;
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 {
-    printf("    >> intercepted send(%d, %p, %zu, %d)\n%.*s\n",
+    dn_log("    >> intercepted send(%d, %p, %zu, %d)\n%.*s\n",
         sockfd, buf, len, flags, (int)len, (const char*)buf);
     //return do_write(sockfd, buf, len);
     return syscall(SYS_sendto, sockfd, buf, len, flags, 0, 0);
@@ -223,10 +286,10 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                  const struct sockaddr *dest_addr, socklen_t addrlen)
 {
     ssize_t st;
-    printf("    >> intercepted sendto(%d, %p, %zu, %d, %p, %lu)\n",
+    dn_log("    >> intercepted sendto(%d, %p, %zu, %d, %p, %lu)\n",
         sockfd, buf, len, flags, dest_addr, (unsigned long)addrlen);
     st = syscall(SYS_sendto, sockfd, buf, len, flags, dest_addr, addrlen);
-    printf("sendto()ed %zu bytes: %.*s\n", st, (int)st, (const char *)buf);
+    dn_log("sendto()ed %zu bytes: %.*s\n", st, (int)st, (const char *)buf);
     return st;
 }
 
@@ -234,46 +297,57 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                  struct sockaddr *src_addr, socklen_t *addrlen)
 {
     ssize_t rf;
-    printf("    >> intercepted recvfrom(%d, %p, %zu, %d, %p, %p)\n",
+    dn_log("    >> intercepted recvfrom(%d, %p, %zu, %d, %p, %p)\n",
         sockfd, buf, len, flags, src_addr, addrlen);
     rf = syscall(SYS_recvfrom, sockfd, buf, len, flags, src_addr, addrlen);
-    printf("recvfrom()ed %zd bytes: %.*s\n", rf, (int)rf, (const char *)buf);
+    dn_log("recvfrom()ed %zd bytes: ...\n", rf);
     return rf;
 }
 
 ssize_t read(int fd, void *buf, size_t count)
 {
-    printf("    >> intercepted read(%d, %p, %zu)\n%.*s\n",
-        fd, buf, count, (int)count, (const char*)buf);
-    return do_read(fd, buf, count);
+    ssize_t dr;
+    dn_log("    >> intercepted read(%d, %p, %zu)\n", fd, buf, count);
+    dr = do_read(fd, buf, count, 0);
+    dn_log("%.*s\n", (int)dr, (const char*)buf);
+    dn_log("    << done with read()...\n");
+    return dr;
 }
 
-static ssize_t do_read(int fd, void *buf, size_t count)
+static ssize_t do_read(int fd, void *buf, size_t count, int recvflags)
 {
     ssize_t rd;
-    if (!Socket[fd].domain)
+    struct trackedsocket *t = Socket+fd;
+    if (!t->domain)
     {
         /* not tracked, pass it through */
         rd = syscall(SYS_read, fd, buf, count);
     } else {
-        struct trackedsocket *t = Socket+fd;
         unsigned char *ptr;
         /* try local cache first... */
-        rd = ratelim_get(&t->rd, &ptr, count);
-        if (rd > 0)
+        rd = ratelim_get(t, &t->rd, &ptr, count, recvflags);
+        if (!rd && errno == EAGAIN)
+        {
+            errno = EAGAIN;
+            return -1;
+        } else if (rd > 0)
         {
             memcpy(buf, ptr, rd);
         } else if (!rd) {
             /* if local cache is empty, do the real read()... */
+            dn_log("        >> syscall(SYS_READ, %d, %p, %zu)\n", fd, buf, count);
             rd = syscall(SYS_read, fd, buf, count);
-            if (rd >= 0) /* success */
+            if (rd < 0)
+            {
+                dn_log("read returned %zd, errno=%d (EAGAIN=%d)\n", rd, errno, EAGAIN);
+            } else if (rd >= 0) /* success */
             {
                 if (rd > 0)
                 {
                     /* if data's returned, cache it... */
-                    (void)ratelim_put(&t->rd, buf, count);
+                    (void)ratelim_put(&t->rd, buf, rd);
                     /* and read it out again... */
-                    rd = ratelim_get(&t->rd, &ptr, count);
+                    rd = ratelim_get(t, &t->rd, &ptr, count, recvflags);
                     memcpy(buf, ptr, rd);
                 }
             }
@@ -293,7 +367,7 @@ static ssize_t do_write(int fd, const void *buf, size_t count)
     } else {
         unsigned char *ptr;
         (void)ratelim_put(&t->wr, buf, count);
-        wr = ratelim_get(&t->wr, &ptr, count);
+        wr = ratelim_get(t, &t->wr, &ptr, count, 0);
         if (wr)
         {
             /* if local cache is empty, do actual call... */
@@ -311,16 +385,16 @@ static ssize_t do_write(int fd, const void *buf, size_t count)
 
 ssize_t write(int fd, const void *buf, size_t count)
 {
-    printf("    >> intercepted write(%d, %p, %zu)\n", fd, buf, count);
+    dn_log("    >> intercepted write(%d, %p, %zu)\n%.*s\n", fd, buf, count, (int)count, (const char*)buf);
     return do_write(fd, buf, count);
 }
 
 int close(int fd)
 {
-    printf("    >> intercepted close(%d)\n", fd);
+    dn_log("    >> intercepted close(%d)\n", fd);
     if (Socket[fd].domain)
     {
-        printf("        >> it's a socket\n");
+        dn_log("        >> it's a socket\n");
         trackedsocket_destroy(fd);
     }
     return syscall(SYS_close, fd);
