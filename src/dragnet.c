@@ -12,8 +12,10 @@
  *   LD_PRELOAD=./dragnet.so foo
  *
  * Examples:
- *   LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 2>/dev/null # watch google load in slow-mo
- *   LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 1>/dev/null # watch dragnet's actions
+ *   LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 2>/dev/null
+ *   LD_PRELOAD=./dragnet.so wget http://www.google.com/ -O - 1>/dev/null
+ *   LD_PRELOAD=./dragnet.so curl http://www.google.com/ -o - 2>/dev/null
+ *   LD_PRELOAD=./dragnet.so curl http://www.google.com/ -o - 1>/dev/null
  *
  * Status:
  *  - wget works
@@ -21,7 +23,6 @@
  *
  * TODO:
  *  - separate send/recv rate limiting
- *  - make options set-able from env?
  */
 
 #include <sys/syscall.h>
@@ -35,12 +36,15 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/select.h>
+#include <poll.h>
 
+static int Initialized = 0;
 /*
  * Rate Limiting : maximum bytes/sec we'll allow through; the rest is cached for future calls
  * 0 means unlimited
  */
-static size_t MaxBytesPerSec = 256;
+static unsigned long MaxBytesPerSec = 256;
 //static size_t MaxSendBytesPerSec = 50;
 //static size_t MaxRecvBytesPerSec = 50;
 
@@ -53,6 +57,16 @@ static ssize_t MinByteCount = 0; // TODO
 static ssize_t MaxByteCount = 0; // TODO
 static int     RandomizeByteCount = 0; // TODO
 #endif
+
+static void do_dragnet_init(void)
+{
+    char *c;
+    if ((c = getenv("DRAGNET_BPS")))
+    {
+        MaxBytesPerSec = strtoul(c, NULL, 10);
+    }
+    Initialized = 1;
+}
 
 /*
  * per-Socket ratelimiting
@@ -129,25 +143,35 @@ static ssize_t ratelim_get(struct trackedsocket *t, struct ratelim **rl,
 {
     struct ratelim *r = *rl;
     ssize_t bytes = 0;
-    dn_log("%s(%p, %p, %zu, %d)...\n", __func__, rl, ptr, len, recvflags);
-    if (r && r->len > r->pos)
+    unsigned peek = (recvflags & MSG_PEEK);
+    dn_log("        >> %s(%p, %p, %zu, %d)...\n", __func__, rl, ptr, len, recvflags);
+    if (r && r->pos < r->len)
     {
         struct timeval now;
         (void)gettimeofday(&now, 0);
         if (now.tv_sec > r->sec.tv_sec)
-            r->sec = now, r->secbytes = 0;
-        if (MaxBytesPerSec && r->secbytes == MaxBytesPerSec)
         {
-            if (t->nonblock)
+            r->secbytes = 0; /* reset per-second bytecount if we're in a different second */
+        }
+        if (!peek)
+        {
+            if (now.tv_sec > r->sec.tv_sec)
             {
-                usleep(20000); /* artificially introduce 20msec delay to reduce call count... */
-                errno = EAGAIN;
-                return 0;
-            } else {
-                unsigned long usec = 1000 * 1000 - r->sec.tv_usec;
-                dn_log("      >> sleeping for %lu microseconds on blocking socket...\n", usec);
-                usleep(usec);
-                r->secbytes = 0;
+                r->sec = now; /* only update latest second if we're not peeking */
+            }
+            if (MaxBytesPerSec && r->secbytes == MaxBytesPerSec)
+            {
+                if (t->nonblock)
+                {
+                    usleep(20000); /* artificially introduce 20msec delay to reduce call count... */
+                    errno = EAGAIN;
+                    return 0;
+                } else {
+                    unsigned long usec = 1000 * 1000 - r->sec.tv_usec;
+                    dn_log("      >> sleeping for %lu microseconds on blocking socket...\n", usec);
+                    usleep(usec);
+                    r->secbytes = 0;
+                }
             }
         }
         /* return as many bytes as limiting allows us, and not more than
@@ -156,7 +180,7 @@ static ssize_t ratelim_get(struct trackedsocket *t, struct ratelim **rl,
         if (MaxBytesPerSec)
             bytes = MIN(bytes, MaxBytesPerSec - r->secbytes);
         *ptr = r->data + r->pos;
-        if (recvflags & MSG_PEEK)
+        if (peek)
         {
             /* "peek" doesn't remove data from the queue */
         } else {
@@ -172,8 +196,8 @@ static ssize_t ratelim_get(struct trackedsocket *t, struct ratelim **rl,
             }
         }
     }
-    dn_log("      >> %s(...) = %zd {r->pos=%zu r->len=%zu}\n",
-        __func__, bytes, r ? r->pos : 0, r ? r->len : 0);
+    dn_log("            >> %s(...) = %zd {r=%p r->pos=%zu r->len=%zu}\n",
+        __func__, bytes, r, r ? r->pos : 0, r ? r->len : 0);
     return bytes;
 }
 
@@ -211,6 +235,13 @@ static ssize_t do_read (int fd,       void *buf, size_t count, int recvflags);
 int socket(int domain, int type, int protocol)
 {
     int fd;
+    /*
+     * HACK: since our lib doesn't have a real initializer (since the client program doesn't even know about us)
+     * we take this opportunity to check if we're initialized
+     */
+    if (!Initialized)
+        do_dragnet_init();
+
     fd = syscall(SYS_socket, domain, type, protocol);
     dn_log("    >> intercepted socket(%d, %d, %d) = %d\n",
         domain, type, protocol, fd);
@@ -398,5 +429,60 @@ int close(int fd)
         trackedsocket_destroy(fd);
     }
     return syscall(SYS_close, fd);
+}
+
+int select(int nfds, fd_set *readfds, fd_set *writefds,
+           fd_set *exceptfds, struct timeval *timeout)
+{
+    dn_log("    >> intercepted select(%d, %p, %p, %p, %p)\n", nfds, readfds, writefds, exceptfds, timeout);
+    return syscall(SYS_select, nfds, readfds, writefds, exceptfds, timeout);
+}
+
+static int do_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    int cnt = 0;
+    nfds_t i;
+    if (timeout >= 1000)
+    {
+        /* if we're allowed a second or more, sleep for 1 second to make rate-limited
+         * data available */
+        dn_log("        >> %s sleeping for %lu milliseconds\n", __func__, timeout);
+        usleep(1000 * 1000);
+    }
+    for (i = 0; i < nfds; i++)
+    {
+        struct trackedsocket *t = Socket + fds[i].fd;
+        if (t->domain && (fds[i].events & POLLIN))
+        {
+            unsigned char *ptr;
+            ssize_t rd;
+            /* just figure out if there's anything to read */
+            rd = ratelim_get(t, &t->rd, &ptr, 1, MSG_PEEK); /* FIXME: abusing MSG_PEEK for our own use... */
+            if (rd)
+            {
+                fds[i].revents |= POLLIN;
+                fds[i].revents |= (fds[i].events & POLLIN);
+                cnt++;
+            }
+        }
+    }
+    dn_log("      >> %s(%p, %u, %d) = %d\n", __func__, fds, nfds, timeout);
+    return cnt;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    int p;
+    dn_log("    >> intercepted poll(%p, %d, %d)\n", fds, nfds, timeout);
+    p = do_poll(fds, nfds, timeout);
+    if (!p)
+    {
+        // if we don't find anything, run actual poll
+        if (timeout >= 1000)
+            timeout -= 1000;
+        p = syscall(SYS_poll, fds, nfds, timeout);
+        dn_log("      >> poll(%p, %d, %d) = %d\n", fds, nfds, timeout, p);
+    }
+    return p;
 }
 
