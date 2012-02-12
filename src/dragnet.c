@@ -258,9 +258,9 @@ int fcntl(int fd, int cmd, ... /* arg */ )
         {
             long l = va_arg(ap, long);
             dn_log("    >> intercepted fcntl(%d, %d, %ld)\n", fd, cmd, l);
-	        if (cmd == F_SETFL && (l & O_NONBLOCK))
+            if (cmd == F_SETFL && (l & O_NONBLOCK))
             {
-    		    struct trackedsocket *t = trackedsocket_byfd(fd);
+                struct trackedsocket *t = trackedsocket_byfd(fd);
                 t->nonblock = 1;
                 dn_log("      >> fcntl(%d, F_SETFL, &O_NONBLOCK)\n", fd);
             }
