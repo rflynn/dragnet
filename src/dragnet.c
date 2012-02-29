@@ -247,12 +247,12 @@ int fcntl(int fd, int cmd, ... /* arg */ )
     va_start(ap, cmd);
     switch (cmd)
     {
-    case F_DUPFD:
     case F_GETFL:
         /* arg is void */
         dn_log("    >> intercepted fcntl(%d, %d)\n", fd, cmd);
         return syscall(SYS_fcntl, fd, cmd);
     case F_GETFD:
+    case F_DUPFD:
     case F_SETFL:
         /* arg is long */
         {
