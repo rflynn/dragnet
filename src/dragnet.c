@@ -25,6 +25,7 @@
  *  - separate send/recv rate limiting
  */
 
+#define _GNU_SOURCE
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -38,6 +39,7 @@
 #include <fcntl.h>
 #include <sys/select.h>
 #include <poll.h>
+#include <dlfcn.h>
 
 static int Initialized = 0;
 /*
@@ -298,13 +300,17 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags)
     return syscall(SYS_sendto, sockfd, buf, len, flags, 0, 0);
 }
 
-ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
-                 const struct sockaddr *dest_addr, socklen_t addrlen)
+typedef ssize_t (*type_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen)
 {
+    static type_sendto libc_sendto = NULL;
     ssize_t st;
     dn_log("    >> intercepted sendto(%d, %p, %zu, %d, %p, %lu)\n",
         sockfd, buf, len, flags, dest_addr, (unsigned long)addrlen);
-    st = syscall(SYS_sendto, sockfd, buf, len, flags, dest_addr, addrlen);
+    if (!libc_sendto)
+        libc_sendto = (type_sendto) dlsym(RTLD_NEXT, "sendto");
+    st = libc_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
     dn_log("sendto()ed %zu bytes: %.*s\n", st, (int)st, (const char *)buf);
     return st;
 }
